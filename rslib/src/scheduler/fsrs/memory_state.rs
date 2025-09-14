@@ -10,6 +10,7 @@ use fsrs::FSRS;
 use fsrs::FSRS5_DEFAULT_DECAY;
 use fsrs::FSRS6_DEFAULT_DECAY;
 use itertools::Itertools;
+use rayon::iter::{IntoParallelRefMutIterator as _, ParallelIterator as _};
 
 use super::params::ignore_revlogs_before_ms_from_config;
 use super::rescheduler::Rescheduler;
@@ -111,49 +112,60 @@ impl Collection {
             };
             let preset_desired_retention = req.preset_desired_retention;
 
+            let mut to_update_memory_state = Vec::new();
             for (idx, (card_id, item)) in items.into_iter().enumerate() {
                 progress.update(true, |state| state.current_cards = idx as u32 + 1)?;
                 let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
                 let original = card.clone();
 
-                'update_card: {
-                    // Store decay and desired retention in the card so that add-ons, card info,
-                    // stats and browser search/sorts don't need to access the deck config.
-                    // Unlike memory states, scheduler doesn't use decay and dr stored in the card.
-                    let deck_id = card.original_or_current_deck_id();
-                    let desired_retention = *req
-                        .deck_desired_retention
-                        .get(&deck_id)
-                        .unwrap_or(&preset_desired_retention);
-                    card.desired_retention = Some(desired_retention);
-                    card.decay = decay;
-                    let Some(item) = item else {
-                        // clear memory states if item is None
-                        card.memory_state = None;
-                        break 'update_card;
-                    };
-                    card.set_memory_state(&fsrs, Some(item), historical_retention.unwrap())?;
+                // Store decay and desired retention in the card so that add-ons, card info,
+                // stats and browser search/sorts don't need to access the deck config.
+                // Unlike memory states, scheduler doesn't use decay and dr stored in the card.
+                let deck_id = card.original_or_current_deck_id();
+                let desired_retention = *req
+                    .deck_desired_retention
+                    .get(&deck_id)
+                    .unwrap_or(&preset_desired_retention);
+                card.desired_retention = Some(desired_retention);
+                card.decay = decay;
+                if let Some(item) = item {
+                    to_update_memory_state.push((card, original, item));
+                } else {
+                    // clear memory states if item is None
+                    card.memory_state = None;
+                    self.update_card_inner(&mut card, original, usn)?;
+                }
+            }
 
+            to_update_memory_state.par_iter_mut().try_for_each_with(
+                fsrs.clone(),
+                |fsrs, (card, _, item)| {
+                    card.set_memory_state(fsrs, Some(item.clone()), historical_retention.unwrap())
+                },
+            )?;
+
+            for (mut card, original, _) in to_update_memory_state {
+                'reschedule_card: {
                     // if rescheduling
                     let Some(reviews) = &last_revlog_info else {
-                        break 'update_card;
+                        break 'reschedule_card;
                     };
 
                     // and we have a last review time for the card
                     let Some(last_info) = reviews.get(&card.id) else {
-                        break 'update_card;
+                        break 'reschedule_card;
                     };
                     let Some(last_review) = &last_info.last_reviewed_at else {
-                        break 'update_card;
+                        break 'reschedule_card;
                     };
 
                     // and the card's not new
                     let Some(state) = &card.memory_state else {
-                        break 'update_card;
+                        break 'reschedule_card;
                     };
                     // or in (re)learning
                     if card.ctype != CardType::Review {
-                        break 'update_card;
+                        break 'reschedule_card;
                     };
 
                     let deck = self
@@ -163,7 +175,12 @@ impl Collection {
                     // reschedule it
                     let days_elapsed = timing.next_day_at.elapsed_days_since(*last_review) as i32;
                     let original_interval = card.interval;
-                    let interval = fsrs.next_interval(Some(state.stability), desired_retention, 0);
+                    let interval = fsrs.next_interval(
+                        Some(state.stability),
+                        card.desired_retention
+                            .expect("We set desired retention above"),
+                        0,
+                    );
                     card.interval = rescheduler
                         .as_mut()
                         .and_then(|r| {
@@ -198,7 +215,6 @@ impl Collection {
                     // Add a rescheduled revlog entry
                     self.log_rescheduled_review(&card, original_interval, usn)?;
                 }
-
                 self.update_card_inner(&mut card, original, usn)?;
             }
         }
@@ -272,7 +288,7 @@ impl Card {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct FsrsItemForMemoryState {
     pub item: FSRSItem,
     /// When revlogs have been truncated, this stores the initial state at first
