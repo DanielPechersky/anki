@@ -10,7 +10,8 @@ use fsrs::FSRS;
 use fsrs::FSRS5_DEFAULT_DECAY;
 use fsrs::FSRS6_DEFAULT_DECAY;
 use itertools::Itertools;
-use rayon::iter::{IntoParallelRefMutIterator as _, ParallelIterator as _};
+use rayon::iter::IntoParallelRefMutIterator as _;
+use rayon::iter::ParallelIterator as _;
 
 use super::params::ignore_revlogs_before_ms_from_config;
 use super::rescheduler::Rescheduler;
