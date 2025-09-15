@@ -627,4 +627,27 @@ mod tests {
         );
         Ok(())
     }
+
+    mod update_memory_state {
+        use crate::collection::CollectionBuilder;
+
+        use super::*;
+
+        #[test]
+        fn smoke() {
+            let mut collection = CollectionBuilder::default().build().unwrap();
+            let entry = UpdateMemoryStateEntry {
+                req: None,
+                search: SearchNode::WholeCollection,
+                ignore_before: TimestampMillis(0),
+            };
+
+            collection
+                .transact(Op::UpdateDeckConfig, |collection| {
+                    collection.update_memory_state(vec![entry]).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
 }
