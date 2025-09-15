@@ -10,8 +10,6 @@ use fsrs::FSRS;
 use fsrs::FSRS5_DEFAULT_DECAY;
 use fsrs::FSRS6_DEFAULT_DECAY;
 use itertools::Itertools;
-use rayon::iter::IntoParallelRefMutIterator as _;
-use rayon::iter::ParallelIterator as _;
 
 use super::params::ignore_revlogs_before_ms_from_config;
 use super::rescheduler::Rescheduler;
@@ -113,7 +111,9 @@ impl Collection {
             };
             let preset_desired_retention = req.preset_desired_retention;
 
-            let mut to_update_memory_state = Vec::new();
+            let mut to_update = Vec::new();
+            let mut fsrs_items = Vec::new();
+            let mut starting_states = Vec::new();
             for (idx, (card_id, item)) in items.into_iter().enumerate() {
                 progress.update(true, |state| state.current_cards = idx as u32 + 1)?;
                 let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
@@ -130,7 +130,9 @@ impl Collection {
                 card.desired_retention = Some(desired_retention);
                 card.decay = decay;
                 if let Some(item) = item {
-                    to_update_memory_state.push((card, original, item));
+                    to_update.push((card, original));
+                    fsrs_items.push(item.item);
+                    starting_states.push(item.starting_state);
                 } else {
                     // clear memory states if item is None
                     card.memory_state = None;
@@ -138,14 +140,11 @@ impl Collection {
                 }
             }
 
-            to_update_memory_state.par_iter_mut().try_for_each_with(
-                fsrs.clone(),
-                |fsrs, (card, _, item)| {
-                    card.set_memory_state(fsrs, Some(item.clone()), historical_retention.unwrap())
-                },
-            )?;
+            let memory_states = fsrs.memory_state_batch(fsrs_items, starting_states)?;
 
-            for (mut card, original, _) in to_update_memory_state {
+            for ((mut card, original), memory_state) in to_update.into_iter().zip(memory_states) {
+                card.memory_state = Some(memory_state.into());
+
                 'reschedule_card: {
                     // if rescheduling
                     let Some(reviews) = &last_revlog_info else {
@@ -157,11 +156,6 @@ impl Collection {
                         break 'reschedule_card;
                     };
                     let Some(last_review) = &last_info.last_reviewed_at else {
-                        break 'reschedule_card;
-                    };
-
-                    // and the card's not new
-                    let Some(state) = &card.memory_state else {
                         break 'reschedule_card;
                     };
                     // or in (re)learning
@@ -177,7 +171,7 @@ impl Collection {
                     let days_elapsed = timing.next_day_at.elapsed_days_since(*last_review) as i32;
                     let original_interval = card.interval;
                     let interval = fsrs.next_interval(
-                        Some(state.stability),
+                        Some(memory_state.stability),
                         card.desired_retention
                             .expect("We set desired retention above"),
                         0,
