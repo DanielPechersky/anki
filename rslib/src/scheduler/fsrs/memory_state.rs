@@ -102,7 +102,7 @@ impl Collection {
                 )?;
                 // clear FSRS data if FSRS is disabled
                 self.clear_fsrs_data_for_cards(items.into_iter().map(|(card_id, _)| card_id), usn)?;
-                return Ok(());
+                continue;
             };
 
             let fsrs = FSRS::new(Some(&req.params[..]))?;
