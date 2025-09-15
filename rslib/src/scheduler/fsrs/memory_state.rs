@@ -9,20 +9,21 @@ use fsrs::MemoryState;
 use fsrs::FSRS;
 use fsrs::FSRS5_DEFAULT_DECAY;
 use fsrs::FSRS6_DEFAULT_DECAY;
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 
 use super::params::ignore_revlogs_before_ms_from_config;
 use super::rescheduler::Rescheduler;
+use crate::card::CardType;
+use crate::prelude::*;
 use crate::revlog::RevlogEntry;
 use crate::scheduler::answering::get_fuzz_seed;
 use crate::scheduler::fsrs::params::reviews_for_fsrs;
 use crate::scheduler::fsrs::params::Params;
 use crate::scheduler::states::fuzz::with_review_fuzz;
+use crate::scheduler::timing::SchedTimingToday;
 use crate::search::Negated;
 use crate::search::SearchNode;
 use crate::search::StateKind;
-use crate::{card::CardType, progress::ThrottlingProgressHandler};
-use crate::{prelude::*, scheduler::timing::SchedTimingToday};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ComputeMemoryProgress {
@@ -107,27 +108,53 @@ impl Collection {
                 ignore_before,
             )?;
 
-            let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
-            progress.update(false, |s| s.total_cards = items.len() as u32)?;
             let Some(req) = &req else {
                 // clear FSRS data if FSRS is disabled
-                self.clear_fsrs_data_for_cards(
-                    items.into_iter().map(|(card_id, _)| card_id),
-                    usn,
-                    &mut progress,
-                )?;
+                self.clear_fsrs_data_for_cards(items.into_iter().map(|(card_id, _)| card_id), usn)?;
                 return Ok(());
             };
             let last_revlog_info = last_revlog_info.unwrap();
 
-            self.update_memory_state_for_items(
+            let (items, cards_without_items): (Vec<(CardId, FsrsItemForMemoryState)>, Vec<CardId>) =
+                items.into_iter().partition_map(|(card_id, item)| {
+                    if let Some(item) = item {
+                        Either::Left((card_id, item))
+                    } else {
+                        Either::Right(card_id)
+                    }
+                });
+
+            let decay = get_decay_from_params(&req.params);
+
+            // Store decay and desired retention in the card so that add-ons, card info,
+            // stats and browser search/sorts don't need to access the deck config.
+            // Unlike memory states, scheduler doesn't use decay and dr stored in the card.
+            let set_decay_and_desired_retention = move |card: &mut Card| {
+                let deck_id = card.original_or_current_deck_id();
+
+                let desired_retention = *req
+                    .deck_desired_retention
+                    .get(&deck_id)
+                    .unwrap_or(&req.preset_desired_retention);
+
+                card.desired_retention = Some(desired_retention);
+                card.decay = Some(decay);
+            };
+
+            self.update_memory_state_for_itemless_cards(
+                cards_without_items,
+                set_decay_and_desired_retention,
+                usn,
+            )?;
+
+            self.update_memory_state_for_cards_with_items(
                 items,
                 last_revlog_info,
                 req,
                 &fsrs,
                 rescheduler,
-                &mut progress,
                 timing,
+                set_decay_and_desired_retention,
                 usn,
             )?;
         }
@@ -136,10 +163,11 @@ impl Collection {
 
     fn clear_fsrs_data_for_cards(
         &mut self,
-        cards: impl Iterator<Item = CardId>,
+        cards: impl ExactSizeIterator<Item = CardId>,
         usn: Usn,
-        progress: &mut ThrottlingProgressHandler<ComputeMemoryProgress>,
     ) -> Result<()> {
+        let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
+        progress.update(false, |s| s.total_cards = cards.len() as u32)?;
         for (idx, card_id) in cards.enumerate() {
             progress.update(true, |state| state.current_cards = idx as u32 + 1)?;
             let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
@@ -150,56 +178,59 @@ impl Collection {
         Ok(())
     }
 
-    #[expect(clippy::too_many_arguments)]
-    fn update_memory_state_for_items(
+    fn update_memory_state_for_itemless_cards(
         &mut self,
-        mut items: Vec<(CardId, Option<FsrsItemForMemoryState>)>,
+        cards: Vec<CardId>,
+        mut set_decay_and_desired_retention: impl FnMut(&mut Card),
+        usn: Usn,
+    ) -> Result<()> {
+        let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
+        progress.update(false, |s| s.total_cards = cards.len() as u32)?;
+        for (idx, card_id) in cards.into_iter().enumerate() {
+            progress.update(true, |state| state.current_cards = idx as u32 + 1)?;
+            let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
+            let original = card.clone();
+            set_decay_and_desired_retention(&mut card);
+            card.memory_state = None;
+            self.update_card_inner(&mut card, original, usn)?;
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn update_memory_state_for_cards_with_items(
+        &mut self,
+        mut items: Vec<(CardId, FsrsItemForMemoryState)>,
         last_revlog_info: HashMap<CardId, LastRevlogInfo>,
 
         req: &UpdateMemoryStateRequest,
         fsrs: &FSRS,
         mut rescheduler: Option<Rescheduler>,
-        progress: &mut ThrottlingProgressHandler<ComputeMemoryProgress>,
         timing: SchedTimingToday,
+        mut set_decay_and_desired_retention: impl FnMut(&mut Card),
 
         usn: Usn,
     ) -> Result<()> {
         const ITEM_CHUNK_SIZE: usize = 100_000;
         const FSRS_CHUNK_SIZE: usize = 1000;
 
-        let decay = get_decay_from_params(&req.params);
-
         let mut to_update = Vec::new();
         let mut fsrs_items = Vec::new();
         let mut starting_states = Vec::new();
+
+        let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
+        progress.update(false, |s| s.total_cards = items.len() as u32)?;
         for (i, items) in items.chunk_into_vecs(ITEM_CHUNK_SIZE).enumerate() {
             progress.update(true, |state| {
                 let end_of_chunk_index = i * ITEM_CHUNK_SIZE + items.len();
                 state.current_cards = end_of_chunk_index as u32 + 1
             })?;
             for (card_id, item) in items.into_iter() {
-                let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
-                let original = card.clone();
+                let card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
 
-                // Store decay and desired retention in the card so that add-ons, card info,
-                // stats and browser search/sorts don't need to access the deck config.
-                // Unlike memory states, scheduler doesn't use decay and dr stored in the card.
-                let deck_id = card.original_or_current_deck_id();
-                let desired_retention = *req
-                    .deck_desired_retention
-                    .get(&deck_id)
-                    .unwrap_or(&req.preset_desired_retention);
-                card.desired_retention = Some(desired_retention);
-                card.decay = Some(decay);
-                if let Some(item) = item {
-                    to_update.push((card, original));
-                    fsrs_items.push(item.item);
-                    starting_states.push(item.starting_state);
-                } else {
-                    // clear memory states if item is None
-                    card.memory_state = None;
-                    self.update_card_inner(&mut card, original, usn)?;
-                }
+                to_update.push(card);
+                fsrs_items.push(item.item);
+                starting_states.push(item.starting_state);
             }
 
             // fsrs.memory_state_batch is O(nm) where n is the number of cards and m is the max review count between all items.
@@ -216,8 +247,9 @@ impl Collection {
             {
                 let memory_states = fsrs.memory_state_batch(fsrs_items, starting_states)?;
 
-                for ((mut card, original), memory_state) in to_update.into_iter().zip(memory_states)
-                {
+                for (mut card, memory_state) in to_update.into_iter().zip(memory_states) {
+                    let original = card.clone();
+                    set_decay_and_desired_retention(&mut card);
                     card.memory_state = Some(memory_state.into());
 
                     'reschedule_card: {
