@@ -304,9 +304,7 @@ impl Collection {
         let mut starting_states = Vec::new();
 
         for (card_id, item) in items.into_iter() {
-            let card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
-
-            to_update.push(card);
+            to_update.push(card_id);
             fsrs_items.push(item.item);
             starting_states.push(item.starting_state);
         }
@@ -325,7 +323,8 @@ impl Collection {
         {
             let memory_states = fsrs.memory_state_batch(fsrs_items, starting_states)?;
 
-            for (mut card, memory_state) in to_update.into_iter().zip_eq(memory_states) {
+            for (card_id, memory_state) in to_update.into_iter().zip_eq(memory_states) {
+                let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
                 let original = card.clone();
                 set_decay_and_desired_retention(&mut card);
                 card.memory_state = Some(memory_state.into());
