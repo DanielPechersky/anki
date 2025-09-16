@@ -65,7 +65,7 @@ trait ChunkIntoVecs<T> {
 impl<T> ChunkIntoVecs<T> for Vec<T> {
     fn chunk_into_vecs(&mut self, chunk_size: usize) -> impl Iterator<Item = Vec<T>> {
         std::iter::from_fn(move || {
-            (!self.is_empty()).then(|| self.split_off(chunk_size.min(self.len())))
+            (!self.is_empty()).then(|| self.drain(..chunk_size.min(self.len())).collect())
         })
     }
 }
@@ -100,8 +100,15 @@ impl Collection {
                     0.9,
                     ignore_before,
                 )?;
+
+                let on_updated_card = self.create_progress_closure(items.len())?;
+
                 // clear FSRS data if FSRS is disabled
-                self.clear_fsrs_data_for_cards(items.into_iter().map(|(card_id, _)| card_id), usn)?;
+                self.clear_fsrs_data_for_cards(
+                    items.into_iter().map(|(card_id, _)| card_id),
+                    usn,
+                    on_updated_card,
+                )?;
                 continue;
             };
 
@@ -115,6 +122,8 @@ impl Collection {
                 req.historical_retention,
                 ignore_before,
             )?;
+
+            let mut on_updated_card = self.create_progress_closure(items.len())?;
 
             let (items, cards_without_items): (Vec<(CardId, FsrsItemForMemoryState)>, Vec<CardId>) =
                 items.into_iter().partition_map(|(card_id, item)| {
@@ -146,6 +155,7 @@ impl Collection {
                 cards_without_items,
                 set_decay_and_desired_retention,
                 usn,
+                &mut on_updated_card,
             )?;
 
             let mut rescheduler = self
@@ -228,24 +238,34 @@ impl Collection {
                 set_decay_and_desired_retention,
                 reschedule,
                 usn,
+                on_updated_card,
             )?;
         }
         Ok(())
     }
 
+    fn create_progress_closure(&self, item_count: usize) -> Result<impl FnMut() -> Result<()>> {
+        let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
+        progress.update(false, |s| {
+            s.total_cards = item_count as u32;
+            s.current_cards = 1;
+        })?;
+        let on_updated_card = move || progress.update(true, |p| p.current_cards += 1);
+        Ok(on_updated_card)
+    }
+
     fn clear_fsrs_data_for_cards(
         &mut self,
-        cards: impl ExactSizeIterator<Item = CardId>,
+        cards: impl Iterator<Item = CardId>,
         usn: Usn,
+        mut on_updated_card: impl FnMut() -> Result<()>,
     ) -> Result<()> {
-        let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
-        progress.update(false, |s| s.total_cards = cards.len() as u32)?;
-        for (idx, card_id) in cards.enumerate() {
-            progress.update(true, |state| state.current_cards = idx as u32 + 1)?;
+        for card_id in cards {
             let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
             let original = card.clone();
             card.clear_fsrs_data();
             self.update_card_inner(&mut card, original, usn)?;
+            on_updated_card()?
         }
         Ok(())
     }
@@ -255,16 +275,15 @@ impl Collection {
         cards: Vec<CardId>,
         mut set_decay_and_desired_retention: impl FnMut(&mut Card),
         usn: Usn,
+        mut on_updated_card: impl FnMut() -> Result<()>,
     ) -> Result<()> {
-        let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
-        progress.update(false, |s| s.total_cards = cards.len() as u32)?;
-        for (idx, card_id) in cards.into_iter().enumerate() {
-            progress.update(true, |state| state.current_cards = idx as u32 + 1)?;
+        for card_id in cards {
             let mut card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
             let original = card.clone();
             set_decay_and_desired_retention(&mut card);
             card.memory_state = None;
             self.update_card_inner(&mut card, original, usn)?;
+            on_updated_card()?;
         }
         Ok(())
     }
@@ -276,6 +295,7 @@ impl Collection {
         mut set_decay_and_desired_retention: impl FnMut(&mut Card),
         mut maybe_reschedule_card: impl FnMut(&mut Card, &mut Self, &FSRS) -> Result<()>,
         usn: Usn,
+        mut on_updated_card: impl FnMut() -> Result<()>,
     ) -> Result<()> {
         const ITEM_CHUNK_SIZE: usize = 100_000;
         const FSRS_CHUNK_SIZE: usize = 1000;
@@ -284,13 +304,7 @@ impl Collection {
         let mut fsrs_items = Vec::new();
         let mut starting_states = Vec::new();
 
-        let mut progress = self.new_progress_handler::<ComputeMemoryProgress>();
-        progress.update(false, |s| s.total_cards = items.len() as u32)?;
-        for (i, items) in items.chunk_into_vecs(ITEM_CHUNK_SIZE).enumerate() {
-            progress.update(true, |state| {
-                let end_of_chunk_index = i * ITEM_CHUNK_SIZE + items.len();
-                state.current_cards = end_of_chunk_index as u32 + 1
-            })?;
+        for items in items.chunk_into_vecs(ITEM_CHUNK_SIZE) {
             for (card_id, item) in items.into_iter() {
                 let card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
 
@@ -319,6 +333,7 @@ impl Collection {
                     card.memory_state = Some(memory_state.into());
                     maybe_reschedule_card(&mut card, self, fsrs)?;
                     self.update_card_inner(&mut card, original, usn)?;
+                    on_updated_card()?;
                 }
             }
         }
