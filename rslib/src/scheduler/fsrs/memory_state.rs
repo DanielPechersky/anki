@@ -9,7 +9,8 @@ use fsrs::MemoryState;
 use fsrs::FSRS;
 use fsrs::FSRS5_DEFAULT_DECAY;
 use fsrs::FSRS6_DEFAULT_DECAY;
-use itertools::{Either, Itertools};
+use itertools::Either;
+use itertools::Itertools;
 
 use super::params::ignore_revlogs_before_ms_from_config;
 use super::rescheduler::Rescheduler;
@@ -309,8 +310,9 @@ impl Collection {
             starting_states.push(item.starting_state);
         }
 
-        // fsrs.memory_state_batch is O(nm) where n is the number of cards and m is the max review count between all items.
-        // Therefore we want to pass batches to fsrs.memory_state_batch where the review count is relatively even.
+        // fsrs.memory_state_batch is O(nm) where n is the number of cards and m is the
+        // max review count between all items. Therefore we want to pass batches
+        // to fsrs.memory_state_batch where the review count is relatively even.
         let mut p = permutation::sort_unstable_by_key(&fsrs_items, |item| item.reviews.len());
         p.apply_slice_in_place(&mut to_update);
         p.apply_slice_in_place(&mut fsrs_items);
@@ -640,9 +642,8 @@ mod tests {
     }
 
     mod update_memory_state {
-        use crate::collection::CollectionBuilder;
-
         use super::*;
+        use crate::collection::CollectionBuilder;
 
         #[test]
         fn smoke() {
