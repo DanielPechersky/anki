@@ -290,51 +290,48 @@ impl Collection {
 
     fn update_memory_state_for_cards_with_items(
         &mut self,
-        mut items: Vec<(CardId, FsrsItemForMemoryState)>,
+        items: Vec<(CardId, FsrsItemForMemoryState)>,
         fsrs: &FSRS,
         mut set_decay_and_desired_retention: impl FnMut(&mut Card),
         mut maybe_reschedule_card: impl FnMut(&mut Card, &mut Self, &FSRS) -> Result<()>,
         usn: Usn,
         mut on_updated_card: impl FnMut() -> Result<()>,
     ) -> Result<()> {
-        const ITEM_CHUNK_SIZE: usize = 100_000;
-        const FSRS_CHUNK_SIZE: usize = 1000;
+        const FSRS_BATCH_SIZE: usize = 1000;
 
         let mut to_update = Vec::new();
         let mut fsrs_items = Vec::new();
         let mut starting_states = Vec::new();
 
-        for items in items.chunk_into_vecs(ITEM_CHUNK_SIZE) {
-            for (card_id, item) in items.into_iter() {
-                let card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
+        for (card_id, item) in items.into_iter() {
+            let card = self.storage.get_card(card_id)?.or_not_found(card_id)?;
 
-                to_update.push(card);
-                fsrs_items.push(item.item);
-                starting_states.push(item.starting_state);
-            }
+            to_update.push(card);
+            fsrs_items.push(item.item);
+            starting_states.push(item.starting_state);
+        }
 
-            // fsrs.memory_state_batch is O(nm) where n is the number of cards and m is the max review count between all items.
-            // Therefore we want to pass batches to fsrs.memory_state_batch where the review count is relatively even.
-            let mut p = permutation::sort_unstable_by_key(&fsrs_items, |item| item.reviews.len());
-            p.apply_slice_in_place(&mut to_update);
-            p.apply_slice_in_place(&mut fsrs_items);
-            p.apply_slice_in_place(&mut starting_states);
+        // fsrs.memory_state_batch is O(nm) where n is the number of cards and m is the max review count between all items.
+        // Therefore we want to pass batches to fsrs.memory_state_batch where the review count is relatively even.
+        let mut p = permutation::sort_unstable_by_key(&fsrs_items, |item| item.reviews.len());
+        p.apply_slice_in_place(&mut to_update);
+        p.apply_slice_in_place(&mut fsrs_items);
+        p.apply_slice_in_place(&mut starting_states);
 
-            for ((to_update, fsrs_items), starting_states) in to_update
-                .chunk_into_vecs(FSRS_CHUNK_SIZE)
-                .zip_eq(fsrs_items.chunk_into_vecs(FSRS_CHUNK_SIZE))
-                .zip_eq(starting_states.chunk_into_vecs(FSRS_CHUNK_SIZE))
-            {
-                let memory_states = fsrs.memory_state_batch(fsrs_items, starting_states)?;
+        for ((to_update, fsrs_items), starting_states) in to_update
+            .chunk_into_vecs(FSRS_BATCH_SIZE)
+            .zip_eq(fsrs_items.chunk_into_vecs(FSRS_BATCH_SIZE))
+            .zip_eq(starting_states.chunk_into_vecs(FSRS_BATCH_SIZE))
+        {
+            let memory_states = fsrs.memory_state_batch(fsrs_items, starting_states)?;
 
-                for (mut card, memory_state) in to_update.into_iter().zip_eq(memory_states) {
-                    let original = card.clone();
-                    set_decay_and_desired_retention(&mut card);
-                    card.memory_state = Some(memory_state.into());
-                    maybe_reschedule_card(&mut card, self, fsrs)?;
-                    self.update_card_inner(&mut card, original, usn)?;
-                    on_updated_card()?;
-                }
+            for (mut card, memory_state) in to_update.into_iter().zip_eq(memory_states) {
+                let original = card.clone();
+                set_decay_and_desired_retention(&mut card);
+                card.memory_state = Some(memory_state.into());
+                maybe_reschedule_card(&mut card, self, fsrs)?;
+                self.update_card_inner(&mut card, original, usn)?;
+                on_updated_card()?;
             }
         }
         Ok(())
