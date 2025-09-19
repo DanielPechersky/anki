@@ -159,8 +159,9 @@ impl Collection {
                 &mut on_updated_card,
             )?;
 
-            let mut rescheduler = self
-                .get_config_bool(BoolKey::LoadBalancerEnabled)
+            let mut rescheduler = req
+                .reschedule
+                .bitand(self.get_config_bool(BoolKey::LoadBalancerEnabled))
                 .then(|| Rescheduler::new(self))
                 .transpose()?;
 
