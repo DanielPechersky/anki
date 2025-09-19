@@ -159,11 +159,12 @@ impl Collection {
                 &mut on_updated_card,
             )?;
 
-            let mut rescheduler = req
-                .reschedule
-                .bitand(self.get_config_bool(BoolKey::LoadBalancerEnabled))
-                .then(|| Rescheduler::new(self))
-                .transpose()?;
+            let mut rescheduler =
+                if req.reschedule && self.get_config_bool(BoolKey::LoadBalancerEnabled) {
+                    Some(Rescheduler::new(self)?)
+                } else {
+                    None
+                };
 
             let reschedule = move |card: &mut Card,
                                    collection: &mut Self,
